@@ -45,7 +45,7 @@ Client (harness)
 ### Сборка
 
 ```bash
-git clone 
+git clone git@gitverse.ru:Fishman/web-search-llm-tool-selfhosted-rust.git 
 cd sh_web_search_tool_rs
 cargo build --release
 ```
