@@ -1,0 +1,6 @@
+# Static linking for the production target: one self-contained binary that
+# runs on any x86_64 Linux server without OpenSSL/glibc dependencies.
+# Kept per-target on purpose: a global RUSTFLAGS with +crt-static breaks
+# host proc-macro crates (serde_derive, async-trait, rmcp-macros).
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

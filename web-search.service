@@ -1,0 +1,43 @@
+[Unit]
+Description=sh_web_search_tool_rs — DuckDuckGo web search service (HTTP + MCP)
+Documentation=file:///usr/local/share/doc/web-search/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Unprivileged service user, created by install.sh
+User=websearch
+Group=websearch
+# A systemd daemon serves HTTP; MCP stdio is used when an MCP client spawns
+# the binary directly (see README).
+ExecStart=/usr/local/bin/web-search --http-only
+Environment=WEBSEARCH_HOST=127.0.0.1
+Environment=WEBSEARCH_PORT=3333
+Environment=RUST_LOG=info
+Restart=always
+RestartSec=3
+
+# Logging to journald: journalctl -u web-search -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=web-search
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+RemoveIPC=true
+
+[Install]
+WantedBy=multi-user.target

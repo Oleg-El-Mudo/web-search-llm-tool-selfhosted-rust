@@ -1,353 +1,363 @@
 # sh_web_search_tool_rs
 
-Локальный HTTP-сервис поиска по DuckDuckGo с извлечением контента из найденных страниц. Предназначен для использования как HTTP-бэкенд в LLM harness (включая Cherry Studio) для обеспечения моделей доступом к актуальной информации из интернета.
+Локальный сервис поиска по DuckDuckGo с извлечением содержимого найденных страниц.
+Один бинарник, один процесс, два транспорта:
+
+- **HTTP** (Axum, порт `3333`) — для HTTP-бэкендов и харнессов (Cherry Studio и т.п.);
+- **MCP** (Model Context Protocol, stdio) — для LLM-агентов (OpenCode, Claude Desktop, Cherry Studio), которые сами запускают бинарник как дочерний процесс.
+
+Общая логика поиска (`src/search.rs`) у обоих транспортов одна.
 
 ## Возможности
 
-- Поиск по DuckDuckGo (HTML-версия, без JavaScript).
-- Извлечение читаемого контента из найденных страниц (опционально, `fetch_content`).
-- Двухэтапный обход 403: первый запрос ловит `Set-Cookie` с целевого сайта, второй — повторяет запрос с полученными куками.
+- Поиск по DuckDuckGo (HTML-версия, без JavaScript), без API-ключей.
+- Извлечение читаемого контента из найденных страниц (`fetch_content`).
+- Двухэтапный обход `403`: первый запрос ловит `Set-Cookie`, второй повторяет запрос с полученными куками.
 - Обход страницы аномалии DuckDuckGo через извлечение и подстановку `vqd`-токена.
-- Автоматический retry при таймауте подключения.
-- Эвристики "шума": распознаёт оглавления, навигацию и футеры, отфильтровывает их при извлечении контента.
+- Retry при таймауте подключения к DuckDuckGo.
+- Эвристики «шума»: оглавления, навигация и футеры отфильтровываются при извлечении контента.
 - Заголовки браузера: `Referer`, `Cookie`, `Sec-CH-UA-*`, `Sec-Fetch-*` — для обхода базовой защиты от ботов.
+- HTTP и MCP в одном процессе, конкурентно, с корректным завершением по `SIGINT`/`SIGTERM`.
+- Полностью статический бинарник (musl, static-pie): TLS через rustls, OpenSSL не нужен.
 
 ## Архитектура
 
 ```
-Client (harness)
-    |
-    | POST /search
-    v
-+------------------+
-|   Rust Server     |
-|   (Axum + Tokio)  |
-+------------------+
-    |
-    | GET (с заголовками браузера)
-    v
-+------------------+     +------------------+
-| DuckDuckGo HTML  | --> |   Target site    |
-| (поиск + vqd)    |     | (fetch + парсер) |
-+------------------+     +------------------+
+        MCP client (OpenCode, Claude, inspector)      HTTP client (curl, Cherry Studio, harness)
+                 | spawn as child process                            |
+                 v                                                  v
+        +---------------------------------------------------------------+
+        |            sh_web_search_tool_rs  (один процесс)            |
+        |                                                             |
+        |   src/mcp_server.rs            src/http_server.rs          |
+        |   tool: web_search (stdio)     POST/GET /search, /health   |
+        |            \                        /                       |
+        |             +---- src/search.rs ----+                      |
+        |        web_search(query, max_results, fetch_content)       |
+        |        + Markdown-рендер для LLM                           |
+        |                    |                                        |
+        |              reqwest (rustls)                              |
+        +-------------------------------|----------------------------+
+                                        v
+                     +------------------+------------------+
+                     | DuckDuckGo HTML  |  целевые сайты  |
+                     | (поиск + vqd)    | (fetch + parser)|
+                     +------------------+------------------+
+
+Shutdown: SIGINT/SIGTERM -> CancellationToken -> axum graceful shutdown
+                         + rmcp RunningService cancel -> exit 0
+Логи пишутся в stderr: stdout занят JSON-RPC-потоком MCP.
 ```
 
-## Установка
+### Модули
 
-### Требования
+| Файл | Назначение |
+| --- | --- |
+| `src/main.rs` | Точка входа: разбор флагов/ENV, конкурентный запуск обоих серверов, graceful shutdown |
+| `src/search.rs` | Ядро: асинхронный `web_search(query, max_results, fetch_content) -> Vec<SearchResult>`, парсинг DDG, извлечение контента, Markdown-рендер |
+| `src/http_server.rs` | Axum-роуты и HTTP-обработчики (тонкая прослойка над `search`) |
+| `src/mcp_server.rs` | MCP-сервер (`rmcp`, stdio), регистрация инструмента `web_search` |
 
-- Rust toolchain (версия 1.78+). Установить можно с https://rustup.rs/:
-  ```
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  source $HOME/.cargo/env
-  ```
+## Быстрый старт
 
-### Сборка
+Требуется Rust 1.88+ (https://rustup.rs/).
 
-```bash
-git clone git@gitverse.ru:Fishman/web-search-llm-tool-selfhosted-rust.git 
-cd sh_web_search_tool_rs
-cargo build --release
-```
-
-Бинарный файл появится в `target/release/sh_web_search_tool_rs`.
-
-### Запуск
-
-```bash
+```sh
+make build                      # cargo build --release
 ./target/release/sh_web_search_tool_rs
 ```
 
-Сервер слушает `0.0.0.0:3333`. В логах появится строка:
+По умолчанию поднимаются оба сервера: HTTP на `0.0.0.0:3333` и MCP на stdio.
 
-```
-Rust Search Server running on port 3333
-```
+```sh
+# HTTP
+curl -s localhost:3333/health
+curl -s -X POST localhost:3333/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"rust tokio tutorial","max_results":3,"fetch_content":true}'
 
-## API
+# HTTP (GET — удобно для ручной проверки)
+curl -s "localhost:3333/search?query=rust%20tokio&max_results=2&fetch_content=false"
 
-Все запросы — POST на `/search` с заголовком `Content-Type: application/json`.
+# только HTTP
+./target/release/sh_web_search_tool_rs --http-only
 
-### Тело запроса
+# только MCP (для MCP-клиентов)
+./target/release/sh_web_search_tool_rs --mcp-only
 
-| Поле | Тип | По умолчанию | Описание |
-|---|---|---|---|
-| `query` | string | обязателен | Поисковый запрос |
-| `max_results` | integer | 3 | Максимальное число результатов |
-| `fetch_content` | boolean | false | Скачивать и извлекать контент страниц |
-
-### Тело ответа
-
-Массив объектов:
-
-```json
-[
-  {
-    "title": "Заголовок страницы",
-    "url": "https://example.com/article",
-    "snippet": "Краткое описание из поисковой выдачи",
-    "content": "Текст статьи, извлечённый из HTML"
-  }
-]
+# другой порт / хост
+WEBSEARCH_PORT=8080 WEBSEARCH_HOST=127.0.0.1 ./target/release/sh_web_search_tool_rs --http-only
 ```
 
-Если `fetch_content: false`, поле `content` пустое. Если сервер не смог получить страницу (403, таймаут), `content` тоже пустое — модель не путают сообщения об ошибках.
+Остановить: `Ctrl+C` (или `SIGTERM`) — серверы завершаются корректно, код выхода `0`.
 
-## Примеры вызова
-
-### Пример 1. Базовый поиск, без контента
-
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "основы Rust язык программирования",
-    "max_results": 3,
-    "fetch_content": false
-  }' \
-  http://localhost:3333/search
-```
-
-Ответ:
-
-```json
-[
-  {
-    "title": "Руководство по языку программирования Rust",
-    "url": "https://metanit.com/rust/tutorial/",
-    "snippet": "Глава 1. Введение в язык Rust. Общий обзор. Установка. Первая программа. Глава 2. Основы Rust.",
-    "content": ""
-  },
-  {
-    "title": "Обучение Rust с нуля - бесплатный онлайн-курс | Coddy",
-    "url": "https://coddy.tech/landing/ru/rust",
-    "snippet": "Изучайте Rust бесплатно: интерактивные уроки, подсказки ИИ и сертификат.",
-    "content": ""
-  }
-]
-```
-
-### Пример 2. Поиск с извлечением контента
-
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "Rust ownership borrowing tutorial",
-    "max_results": 2,
-    "fetch_content": true
-  }' \
-  http://localhost:3333/search
-```
-
-Ответ — массив из 2 объектов, каждый с полным текстом статьи в поле `content`. Если какой-то сайт вернул 403 — `content` пустой, но `snippet` и `title` есть — модель может оценить релевантность по ним и перейти по `url` самостоятельно.
-
-### Пример 3. Подключение из Python-скрипта
-
-```python
-import requests
-import json
-
-def search(query, max_results=3, fetch_content=True):
-    resp = requests.post(
-        "http://localhost:3333/search",
-        json={
-            "query": query,
-            "max_results": max_results,
-            "fetch_content": fetch_content,
-        },
-    )
-    return resp.json()
-
-results = search("Rust async await", max_results=3)
-for r in results:
-    print(f"[{r['title']}]({r['url']})")
-    if r["content"]:
-        print(r["content"][:500])
-        print("---")
-```
-
-### Пример 4. Использование в LLM-контексте (prompt-шаблон)
-
-```python
-results = search("difference between C++ and Rust memory management", fetch_content=True)
-
-prompt_template = """
-User asked about: {query}
-
-Here are relevant search results:
-
-{results}
-
-Answer the user's question using the information above.
-"""
-
-results_text = ""
-for i, r in enumerate(results, 1):
-    content = r.get("content", "(content unavailable)")
-    results_text += f"--- Result {i}: {r['title']} ---\n"
-    results_text += f"URL: {r['url']}\n"
-    results_text += f"Snippet: {r['snippet']}\n"
-    results_text += f"Content (first 2000 chars):\n{content[:2000]}\n\n"
-
-prompt = prompt_template.format(query=query, results=results_text)
-```
-
-### Пример 5. Поиск по конкретной теме — "дженерики в Rust"
-
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "generics traits Rust programming",
-    "max_results": 5,
-    "fetch_content": true
-  }' \
-  http://localhost:3333/search
-```
-
-### Пример 6. Поиск на русском языке
-
-```bash
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "как работает borrow checker в Rust",
-    "max_results": 3,
-    "fetch_content": true
-  }' \
-  http://localhost:3333/search
-```
-
-## Настройка в качестве инструмента web search
-
-### Cherry Studio — HTTP tool
-
-Добавьте HTTP-инструмент с параметрами:
+### Флаги и переменные окружения
 
 | Параметр | Значение |
-|---|---|
-| URL | `http://localhost:3333/search` |
-| Method | `POST` |
-| Content-Type | `application/json` |
-| Body | `{"query": "{{query}}", "max_results": 3, "fetch_content": true}` |
+| --- | --- |
+| `--http-only` | только HTTP-сервер |
+| `--mcp-only` | только MCP-сервер (stdio) |
+| `-h`, `--help` | справка |
+| `WEBSEARCH_HOST` | адрес HTTP-бинда, по умолчанию `0.0.0.0` |
+| `WEBSEARCH_PORT` / `PORT` | порт HTTP, по умолчанию `3333` |
+| `RUST_LOG` | уровень/фильтр логов, по умолчанию `info` |
 
-### Прямой вызов из кода (JavaScript/TypeScript)
+## HTTP API
 
-```typescript
-async function search(query: string, maxResults = 3): Promise<SearchResult[]> {
-  const resp = await fetch("http://localhost:3333/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, max_results: maxResults, fetch_content: true }),
-  });
-  return resp.json();
-}
+`POST /search`, тело JSON:
 
-// Использование
-const results = await search("Rust vs Zig performance");
-for (const r of results) {
-  console.log(r.title, r.content.length > 0 ? "(has content)" : "(snippet only)");
-}
+```json
+{ "query": "rust tokio tutorial", "max_results": 3, "fetch_content": true }
 ```
 
-### Прямой вызов из Go
+| Поле | Тип | По умолчанию | Описание |
+| --- | --- | --- | --- |
+| `query` | string | обязателен | поисковый запрос |
+| `max_results` | integer | `3` | число результатов (ограничивается диапазоном 1–20) |
+| `fetch_content` | boolean | `false` | скачивать и извлекать содержимое каждой страницы |
 
-```go
-package main
+Ответ — JSON-массив:
 
-import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/http"
-)
+```json
+[
+  {
+    "title": "Tutorial | Tokio - An asynchronous Rust runtime",
+    "url": "https://tokio.rs/tokio/tutorial",
+    "snippet": "Learn how to write asynchronous applications with Tokio...",
+    "content": "извлечённый текст страницы (пусто, если fetch_content=false)"
+  }
+]
+```
 
-type SearchRequest struct {
-	Query        string `json:"query"`
-	MaxResults   int    `json:"max_results"`
-	FetchContent bool   `json:"fetch_content"`
-}
+Замечание: по HTTP `fetch_content` по умолчанию `false` (историческое поведение API), по MCP — `true` (удобно для LLM).
 
-type SearchResult struct {
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	Snippet string `json:"snippet"`
-	Content string `json:"content"`
-}
+Ошибки: `502` с телом `{"error": "..."}` (DuckDuckGo недоступен, страница аномалии, сетевая ошибка).
 
-func Search(query string) ([]SearchResult, error) {
-	reqBody := SearchRequest{
-		Query:        query,
-		MaxResults:   3,
-		FetchContent: true,
-	}
-	body, _ := json.Marshal(reqBody)
-	resp, err := http.Post("http://localhost:3333/search", "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+`GET /health` → `ok`.
 
-	var results []SearchResult
-	json.NewDecoder(resp.Body).Decode(&results)
-	return results, nil
+## MCP: инструмент `web_search`
+
+Схема инструмента (реальный вывод `tools/list`):
+
+```json
+{
+  "name": "web_search",
+  "description": "Search the web (DuckDuckGo) and return the found pages with title, URL, snippet and extracted content as Markdown",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query":         { "type": "string",  "description": "Search query" },
+      "max_results":   { "type": "integer", "default": 3,    "description": "Maximum number of results to return (default: 3)" },
+      "fetch_content": { "type": "boolean", "default": true, "description": "Fetch full page content for every hit (default: true)" }
+    },
+    "required": ["query"]
+  }
 }
 ```
 
-## Структура проекта
+Формат ответа для LLM — Markdown с разделителями:
 
-```
-sh_web_search_tool_rs/
-  Cargo.toml          -- зависимости: axum, reqwest, tokio, scraper, html2text и др.
-  LICENSE             -- GPLv3
-  README.md
-  src/
-    main.rs           -- весь код в одном файле (~550 строк)
-```
+```markdown
+# Web search: rust tokio tutorial
 
-## Отладка
+Found 2 result(s):
 
-Сервер пишет логи в stderr:
+---
 
-```
-INFO sh_web_search_tool_rs: Search: query='osnovy rust', max_results=2, fetch_content=true
-INFO sh_web_search_tool_rs: DDG response length=34250
-INFO sh_web_search_tool_rs: Found 10 result bodies
-INFO sh_web_search_tool_rs: Fetch 403 for https://coddy.tech/landing/ru/rust: 403 Forbidden
-```
+## 1. Tutorial | Tokio - An asynchronous Rust runtime
 
-Ключевые строки:
-- `Search: query=...` — входящий запрос
-- `DDG response length=` — успешный ответ от DuckDuckGo
-- `Found N result bodies` — сколько результатов найдено
-- `Fetch STATUS for URL: STATUS` — результат фетча каждой страницы
+**URL:** https://tokio.rs/tokio/tutorial
 
-Для более детальных логов:
+**Snippet:** Learn how to write asynchronous applications with Tokio...
 
-```bash
-RUST_LOG=debug ./target/release/sh_web_search_tool_rs
+**Content:**
+
+…извлечённый текст страницы, либо «(контент недоступен)»…
+
+---
 ```
 
-## Известные проблемы и план развития
+Содержимое страницы ограничивается 6000 символами (метка `… (content truncated)`), чтобы не раздувать контекст модели. При пустом результате возвращается `isError: true` с текстом `No results found for '<query>'`.
 
-### Текущие ограничения
+Ручная проверка MCP-транспорта:
 
-- **metanit.com** — при фетче контента возвращается index-страница (оглавление всего туториала) вместо первой главы. Эвристика `looks_like_noise` пропускает её, так как она содержит текст и заголовки.
-- **coddy.tech** — отдаёт 403 даже после двухэтапного обхода с Cookie. Вероятно, используется глубокая проверка User-Agent (UA fingerprinting) на уровне Cloudflare или AWS WAF.
-- **ru.wikipedia.org** — требует заголовка `Referer` с домена wikipedia.org, иначе отдаёт 403. Текущий `Referer: https://duckduckgo.com/` не работает.
-- **Оглавление вместо статьи** — у некоторых сайтов (например rust.codeutility.io) селектор `main` может вернуть страницу навигации/оглавления вместо статьи.
-- **Таймауты** — при медленном соединении DDG может не отвечать за 25 секунд, и retry не помогает. В этом случае возвращается пустой массив результатов.
+```sh
+printf '%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli","version":"1"}}}' \
+ '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+ '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"musl static rust","max_results":2,"fetch_content":false}}}' \
+ | ./target/release/sh_web_search_tool_rs --mcp-only 2>/dev/null
 
-### Что можно улучшить
+# или через официальный инспектор
+npx @modelcontextprotocol/inspector --cli ./target/release/sh_web_search_tool_rs --mcp-only --method tools/list
+```
 
-- **Глубокая навигация по статьям**: если первый ответ — оглавление, автоматически фетчить первую главу или раздел, соответствующий запросу.
-- **Сбор реальных Cookie**: вместо заглушки `sess=abc123` — использовать реальные сессии или `http-cookie`-фреймворк для управления куками между запросами.
-- **Wikipedia-specific headers**: для домена `*.wikipedia.org` добавлять `Referer: https://ru.wikipedia.org/` и `Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6`.
-- **UA-фingerprinting для Cloudflare**: добавить заголовки `Sec-CH-UA-Prefers-Color-Scheme`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Arch`, `Sec-CH-UA-Bitness` в правильном порядке и с актуальными значениями.
-- **Прокси-поддержка**: добавить параметр `proxy` в запрос для обхода геоблокировки и ограничения частоты запросов.
-- **Кэширование результатов**: сохранять кэш ответов DuckDuckGo на N секунд, чтобы одинаковые запросы не шли дважды.
-- **Параллельный фетч контента**: текущая реализация фетчит каждую страницу последовательно — можно сделать параллельно через `tokio::spawn`.
-- **Адаптивные таймауты**: вместо статических 25 секунд — динамический таймаут на основе предыдущих ответов (например, алгоритм с exponential backoff).
-- **Поддержка Bing/Yandex**: переключение между источниками через параметр `search_engine` в запросе.
-- **Docker-образ**: добавить `Dockerfile` для удобства развёртывания.
+## Установка в production
+
+### Статический бинарник
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+make build-static          # static-pie, без внешних зависимостей
+file target/x86_64-unknown-linux-musl/release/sh_web_search_tool_rs
+# ... ELF 64-bit LSB pie executable ... static-pie linked, stripped
+```
+
+Такой бинарник копируется на любой x86_64 Linux-сервер и не требует ни glibc-зависимостей, ни OpenSSL (TLS — `rustls`). `make install` предпочитает именно статическую сборку, если она существует.
+
+### `install.sh` + systemd
+
+```sh
+make install               # build + sudo ./install.sh install
+```
+
+`install.sh install` делает:
+
+1. выбирает бинарник (предпочитает статический musl, иначе `target/release`);
+2. создаёт системного пользователя `websearch` (`nologin`, без home);
+3. кладёт бинарник в `/usr/local/bin/web-search`, unit — в `/etc/systemd/system/web-search.service`, README — в `/usr/local/share/doc/web-search/`;
+4. `systemctl daemon-reload && systemctl enable web-search && systemctl restart web-search`.
+
+Удаление:
+
+```sh
+make uninstall             # sudo ./install.sh uninstall
+```
+
+`web-search.service`: автозапуск (`WantedBy=multi-user.target`, `enable`), запуск от `websearch`, логи в journald (`SyslogIdentifier=web-search`), `Restart=always` + `RestartSec=3`, жёсткая песочница (`ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, без capabilities). Внутри unit используется `--http-only`: stdio-MCP в демоне не имеет смысла, MCP запускается MCP-клиентом.
+
+Сервис слушает `127.0.0.1:3333`. Для доступа из сети поправьте `WEBSEARCH_HOST=0.0.0.0` в unit-файле и перезапустите сервис.
+
+Проверка:
+
+```sh
+systemctl status web-search
+journalctl -u web-search -f
+curl -s localhost:3333/health
+```
+
+## Интеграция с OpenCode (MCP)
+
+Конфигурация проекта — `opencode.jsonc` в корне репозитория (или глобально в `~/.config/opencode/opencode.jsonc`):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "web-search": {
+        "type": "local",
+        "command": ["/usr/local/bin/web-search", "--mcp-only"],
+        "cwd": "~",
+        "environment": {
+          "RUST_LOG": "info"
+        },
+        "codemode": false
+      }
+    }
+  }
+}
+```
+
+`--mcp-only` обязателен: OpenCode сам запускает бинарник как дочерний процесс и общается по stdio, лишний HTTP-бинд только создаёт конфликт портов.
+
+То же самое одной командой:
+
+```sh
+opencode mcp add web-search --env RUST_LOG=info -- /usr/local/bin/web-search --mcp-only
+opencode mcp list          # ✓ web-search  connected
+```
+
+Если OpenCode работает в режиме Code Mode (по умолчанию), доступ к инструменту выглядит так:
+
+```js
+await tools.web_search.web_search({ query: "rust tokio tutorial", max_results: 3, fetch_content: true })
+```
+
+при `codemode: false` инструмент появляется в списке инструментов модели как `web_search_web_search` (`<сервер>_<инструмент>`).
+
+Локальная сборка вместо установленной в `/usr/local/bin`:
+
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "web-search": {
+        "type": "local",
+        "command": ["/home/you/projects/sh_web_search_tool_rs/target/release/sh_web_search_tool_rs", "--mcp-only"]
+      }
+    }
+  }
+}
+```
+
+MCP-подключение к другим клиентам (Claude Desktop и подобные) — тот же принцип: `command` = путь к бинарнику + `--mcp-only`.
+
+## Устранение неполадок
+
+### Логи сервиса
+
+```sh
+journalctl -u web-search -f              # поток логов
+journalctl -u web-search --since "10 min ago"
+systemctl status web-search -n 50        # последние строки + состояние
+```
+
+Уровень логов меняется в unit-файле (`Environment=RUST_LOG=debug`) после `systemctl daemon-reload && systemctl restart web-search`. Логи всегда идут в **stderr** — stdout занят MCP-потоком.
+
+### Проверка живости HTTP
+
+```sh
+curl -s -i localhost:3333/health
+curl -s -i -X POST localhost:3333/search -H 'content-type: application/json' \
+  -d '{"query":"test","max_results":1,"fetch_content":false}'
+```
+
+- `200` в `/health` — процесс жив.
+- `502 {"error":"DuckDuckGo blocked the request (anomaly page)..."}` — DuckDuckGo, см. ниже.
+- `connection refused` — сервис не поднят или слушает другой адрес/порт: проверьте `WEBSEARCH_HOST`/`WEBSEARCH_PORT` в `systemctl cat web-search`.
+
+### Проблемы с DuckDuckGo
+
+| Симптом в логах | Причина | Что делать |
+| --- | --- | --- |
+| `Anomaly page detected, retrying with vqd` затем `Search failed: DuckDuckGo blocked...` | антибот-страница, `vqd`-токен не извлечён или не принят | подождать 30–60 с, уменьшить число запросов, снизить `max_results` |
+| `Found 0 result bodies` | DuckDuckGo отдал страницу без результатов (рейт-лимит/пустая выдача) | повторить запрос, упростить `query` |
+| `DDG first attempt failed ... retrying...` | таймаут/сетевая ошибка | проверить исходящий трафик и DNS с сервера |
+| `"content": ""` или `(контент недоступен)` | сайт отдал `403`, слишком короткий HTML или «шум» вместо текста | норма для части сайтов; попробуйте `fetch_content: false` и сниппет |
+| `Fetch 403 for <url>` | сайт требует cookies/JS | сервис уже пытается повтор с `Set-Cookie`; если не помогает — контент недоступен по существу |
+
+Совет для диагностики: `RUST_LOG=debug` и повтор запроса через `curl` — видно и статус DuckDuckGo, и причину отказа конкретного сайта.
+
+### Порт занят
+
+```
+WARN HTTP server unavailable: Address already in use (MCP keeps running)
+```
+
+В смешанном режиме (HTTP + MCP) конфликт порта не убивает процесс: MCP продолжает работать. Для демона используйте `--http-only` и другой порт (`WEBSEARCH_PORT=8080`).
+
+### MCP-клиент не подключается
+
+- Запускайте бинарник с `--mcp-only` (см. раздел про OpenCode).
+- Не печатайте в stdout: всё stdout — только JSON-RPC. Свои сообщения пишите в stderr.
+- Проверьте вручную через `npx @modelcontextprotocol/inspector --cli <binary> --mcp-only --method tools/list`.
+- `Ctrl+C`/закрытие клиента приводит к `MCP server stopped: Closed` и коду выхода `0`.
+
+### Статическая сборка не получается
+
+- `missing target: run 'rustup target add x86_64-unknown-linux-musl'` — выполните команду.
+- `failed to find tool "x86_64-linux-musl-gcc"` — `ring` (TLS) требует C-компилятор для musl: установите `musl-tools` (Debian/Ubuntu) или `musl-gcc`; `make build-static` сам подхватит `x86_64-linux-musl-gcc`/`musl-gcc`, иначе использует системный `cc`.
+- `-C target-feature=+crt-static` на `x86_64-unknown-linux-gnu` ломает proc-macro-крейты (`serde_derive`, `async-trait`, `rmcp-macros`) — статика включается только для musl-таргета (см. `.cargo/config.toml`).
+
+## Разработка
+
+```sh
+make test        # unit-тесты (парсинг DDG-ссылок, Markdown-рендер, обрезка контента)
+make check       # fmt + clippy (-D warnings) + тесты
+make run         # build + запуск обоих серверов
+make clean
+```
+
+Зависимости: `axum`, `reqwest` (rustls), `rmcp` (официальный Rust SDK для MCP), `scraper`, `html2text`, `tokio`, `tracing`.

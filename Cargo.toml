@@ -1,12 +1,23 @@
 [package]
 name = "sh_web_search_tool_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "DuckDuckGo web search with content extraction, exposed over HTTP and MCP (stdio)"
+license = "GPL-3.0-only"
 
 [dependencies]
 axum = { version = "0.7", features = ["json", "macros"] }
-reqwest = { version = "0.11", features = ["json", "brotli", "gzip", "deflate"] }
+# rustls instead of native-tls: no OpenSSL at runtime, required for a static binary
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "brotli",
+    "gzip",
+    "deflate",
+    "http2",
+] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
@@ -15,3 +26,12 @@ scraper = "0.18"
 html2text = "0.4"
 urlencoding = "2"
 regex = "1"
+thiserror = "2"
+anyhow = "1"
+# MCP (Model Context Protocol) SDK, official Rust implementation
+rmcp = { version = "3.11", features = ["server", "transport-io", "schemars", "macros"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
